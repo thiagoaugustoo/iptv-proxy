@@ -4,39 +4,49 @@ import fs from 'fs';
 import path from 'path';
 
 const app = express();
-  const HLS_DIR = './hls';
 
-    if (!fs.existsSync(HLS_DIR)) {
-      fs.mkdirSync(HLS_DIR, { recursive: true });
-  }
+const PORT = process.env.PORT || 3000;
+const HLS_DIR = './hls';
 
+if (!fs.existsSync(HLS_DIR)) {
+  fs.mkdirSync(HLS_DIR, { recursive: true });
+}
+
+const activeStreams = new Map();
+
+/*
+|--------------------------------------------------------------------------
+| CORS
+|--------------------------------------------------------------------------
+*/
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', '*');
+  next();
+});
+
+/*
+|--------------------------------------------------------------------------
+| M3U Proxy
+|--------------------------------------------------------------------------
+*/
 app.get('/proxy', async (req, res) => {
   try {
-    // 1. Pegamos a URL bruta da requisição (ex: /proxy?url=http...)
-    const rawUrl = req.url; 
-    
-    // 2. Extraímos exatamente tudo o que está após o "?url="
-    const urlIndex = rawUrl.indexOf('?url=');
-    
-    if (urlIndex === -1) {
+    const sourceUrl = req.query.url;
+
+    if (!sourceUrl) {
       return res.status(400).send('URL obrigatória');
     }
-    
-    // Decodifica a URL para garantir que os caracteres especiais funcionem no fetch
-    const targetUrl = decodeURIComponent(rawUrl.substring(urlIndex + 5));
 
-    // 3. Fazemos o fetch com a URL 100% íntegra e um User-Agent robusto
-    const response = await fetch(targetUrl, {
+    const response = await fetch(sourceUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36'
       }
     });
 
     const text = await response.text();
 
-    // Configura os headers de resposta
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    // Dica: listas m3u geralmente usam o content-type 'application/x-mpegurl' ou 'text/plain'
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
 
     res.status(response.status).send(text);
@@ -47,16 +57,22 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-app.listen(3000, () => {
-  console.log('Proxy rodando na porta 3000');
-});
+/*
+|--------------------------------------------------------------------------
+| HLS Static Files
+|--------------------------------------------------------------------------
+*/
+app.use('/hls', express.static(path.resolve(HLS_DIR)));
 
-app.use('/hls', express.static(HLS_DIR));
-
-const activeStreams = new Map();
-
+/*
+|--------------------------------------------------------------------------
+| TS -> HLS
+|--------------------------------------------------------------------------
+*/
 app.get('/stream', async (req, res) => {
+
   try {
+
     const sourceUrl = req.query.url;
 
     if (!sourceUrl) {
@@ -80,23 +96,50 @@ app.get('/stream', async (req, res) => {
 
     if (!activeStreams.has(streamId)) {
 
-      console.log('Iniciando FFmpeg:', streamId);
+      console.log('Iniciando stream:', streamId);
 
       const ffmpeg = spawn('ffmpeg', [
-        '-i', sourceUrl,
 
-        '-c:v', 'copy',
-        '-c:a', 'aac',
+        '-re',
 
-        '-f', 'hls',
+        '-user_agent',
+        'Mozilla/5.0',
 
-        '-hls_time', '4',
-        '-hls_list_size', '6',
+        '-i',
+        sourceUrl,
+
+        '-map',
+        '0',
+
+        '-c:v',
+        'copy',
+
+        '-c:a',
+        'aac',
+
+        '-b:a',
+        '128k',
+
+        '-ac',
+        '2',
+
+        '-f',
+        'hls',
+
+        '-hls_time',
+        '2',
+
+        '-hls_list_size',
+        '10',
 
         '-hls_flags',
-        'delete_segments+append_list',
+        'delete_segments+append_list+independent_segments',
+
+        '-hls_segment_filename',
+        path.join(outputDir, 'segment_%03d.ts'),
 
         playlistPath
+
       ]);
 
       ffmpeg.stderr.on('data', data => {
@@ -108,17 +151,94 @@ app.get('/stream', async (req, res) => {
         activeStreams.delete(streamId);
       });
 
+      ffmpeg.on('error', err => {
+        console.error(err);
+        activeStreams.delete(streamId);
+      });
+
       activeStreams.set(streamId, ffmpeg);
     }
 
-    res.json({
-      hls: `https://proxy.silvatech.dev.br/hls/${streamId}/index.m3u8`
+    // aguarda playlist ser criada
+    let attempts = 0;
+
+    while (!fs.existsSync(playlistPath) && attempts < 20) {
+
+      await new Promise(resolve =>
+        setTimeout(resolve, 500)
+      );
+
+      attempts++;
+    }
+
+    if (!fs.existsSync(playlistPath)) {
+
+      return res.status(500).json({
+        error: 'FFmpeg não conseguiu gerar playlist'
+      });
+
+    }
+
+    return res.json({
+
+      hls:
+        `https://proxy.silvatech.dev.br/hls/${streamId}/index.m3u8`
+
     });
 
   } catch (err) {
+
     console.error(err);
-    res.status(500).json({
+
+    return res.status(500).json({
       error: err.message
     });
+
   }
+});
+
+/*
+|--------------------------------------------------------------------------
+| Cleanup automático
+|--------------------------------------------------------------------------
+*/
+setInterval(() => {
+
+  const now = Date.now();
+
+  for (const [streamId, process] of activeStreams.entries()) {
+
+    const folder = path.join(HLS_DIR, streamId);
+
+    if (!fs.existsSync(folder)) continue;
+
+    const stat = fs.statSync(folder);
+
+    const ageMinutes =
+      (now - stat.mtimeMs) / 1000 / 60;
+
+    if (ageMinutes > 30) {
+
+      console.log('Removendo stream inativo:', streamId);
+
+      process.kill('SIGKILL');
+
+      activeStreams.delete(streamId);
+
+      fs.rmSync(folder, {
+        recursive: true,
+        force: true
+      });
+    }
+  }
+
+}, 300000);
+
+/*
+|--------------------------------------------------------------------------
+| Start
+|--------------------------------------------------------------------------
+*/
+app.listen(PORT, () => {
+  console.log(`Proxy rodando na porta ${PORT}`);
 });
