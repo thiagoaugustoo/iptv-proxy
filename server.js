@@ -1,6 +1,14 @@
 import express from 'express';
 
 const app = express();
+const playlistUrl =
+  'http://ctdg.me/get.php?username=123&password=456&type=m3u_plus&output=ts';
+
+const proxyUrl =
+  'https://proxy.silvatech.dev.br/proxy?url=' +
+  encodeURIComponent(playlistUrl);
+
+fetch(proxyUrl);
 
 app.get('/proxy', async (req, res) => {
   try {
